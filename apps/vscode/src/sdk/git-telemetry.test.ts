@@ -240,6 +240,67 @@ describe("Git snapshots", () => {
 })
 
 describe("conversation Git telemetry", () => {
+	it("emits only state changes across boundaries, including changes back to earlier states", async () => {
+		const tracker = observer()
+		const snapshot = {
+			git: await readGitSnapshot(cwd),
+			workspaceRootCount: 1,
+			sequence: 1,
+			observedAt: new Date().toISOString(),
+			context: {},
+			headChanged: false,
+		}
+		tracker["emit"](snapshot, "chat_open")
+		for (const boundary of ["model_call", "agent_yield", "idle_head_changed"] as const) {
+			tracker["emit"]({ ...snapshot, sequence: 2, observedAt: "later", context: { iteration: 2 } }, boundary, {
+				request_id: "different-request",
+			})
+		}
+		expect(events).toHaveLength(1)
+		const changes = [
+			{ ...snapshot, workspaceRootCount: 2 },
+			...[
+				{ state: "unavailable" as const },
+				{ state: "non_git" as const },
+				{ state: "ok" as const },
+				{ head_sha: "new-head" },
+				{ branch: "other" },
+				{ dirty: true },
+				{ staged: true },
+				{ unstaged: true },
+				{ untracked: true },
+				{ remote_state: "unsupported" as const },
+				{ remote_url: "https://example.test/repo" },
+			].map((git) => ({ ...snapshot, git: { ...snapshot.git, ...git } })),
+		]
+		for (const change of changes) {
+			const count = events.length
+			tracker["emit"](change, "model_call")
+			tracker["emit"](change, "agent_yield")
+			expect(events).toHaveLength(count + 1)
+			tracker["emit"](snapshot, "model_call")
+			expect(events).toHaveLength(count + 2)
+		}
+	})
+
+	it("does not remember an opted-out or failed emission as the last emitted state", async () => {
+		vscodeGit.available = false
+		const tracker = observer()
+		enabled = false
+		await tracker.open()
+		enabled = true
+		const capture = vi.spyOn(telemetry, "capture").mockImplementationOnce(() => {
+			throw new Error("adapter failed")
+		})
+		await tracker.open()
+		expect(events).toHaveLength(0)
+		await tracker.open()
+		await tracker.open()
+		expect(events).toHaveLength(1)
+		expect(capture).toHaveBeenCalledTimes(2)
+		capture.mockRestore()
+	})
+
 	it.each([undefined, 0, 1, 2])("reports the VS Code workspace-folder count (%s), including outside Git", async (count) => {
 		vscodeGit.workspaceFolders =
 			count === undefined
@@ -312,20 +373,19 @@ describe("conversation Git telemetry", () => {
 		expect(events).toHaveLength(0)
 		expect(beforeModel).toHaveBeenCalledTimes(2)
 		expect(afterModel).toHaveBeenCalledTimes(2)
-		await vi.waitFor(() => expect(events).toHaveLength(2))
-		const ordered = events.sort((a, b) => Number(a.properties?.iteration) - Number(b.properties?.iteration))
-		expect(ordered.map((event) => event.properties?.request_id)).toEqual(["request-1", "request-2"])
-		expect(ordered.every((event) => event.properties?.boundary === "model_call")).toBe(true)
-		expect(ordered.map((event) => (event.properties?.git as TelemetryProperties).head_sha)).toEqual([head, head])
+		await vi.waitFor(() => expect(events).toHaveLength(1))
+		expect(events[0].properties).toMatchObject({
+			request_id: `request-${events[0].properties?.iteration}`,
+			boundary: "model_call",
+			git: { head_sha: head },
+		})
 	})
 
-	it("keeps absent and invalid IDs explicitly unjoined", async () => {
+	it.each([undefined, "unsafe header value"])("keeps absent and invalid IDs explicitly unjoined (%s)", async (id) => {
 		const tracker = observer()
-		for (const id of [undefined, "unsafe header value"]) {
-			const finish = await beginModel(tracker)
-			await finish(id)
-		}
-		await vi.waitFor(() => expect(events).toHaveLength(2))
+		const finish = await beginModel(tracker)
+		await finish(id)
+		await vi.waitFor(() => expect(events).toHaveLength(1))
 		expect(events.every((event) => event.properties?.request_id_status === "missing")).toBe(true)
 		expect(events.every((event) => event.properties?.request_id === undefined)).toBe(true)
 		expect(JSON.stringify(events)).not.toContain("unsafe header value")
@@ -407,8 +467,12 @@ describe("conversation Git telemetry", () => {
 		const tracker = observer()
 		const first = await beginModel(tracker, 1)
 		await first("request-1")
-		await tracker.configure().hooks?.onEvent?.(runtimeEvent("run-finished"))
+		await vi.waitFor(() => expect(events).toHaveLength(1))
+		const enabledCheck = vi.spyOn(telemetry, "isEnabled")
 		const second = await beginModel(tracker, 2)
+		await vi.waitFor(() => expect(enabledCheck.mock.calls.length).toBeGreaterThanOrEqual(3))
+		await writeFile(join(cwd, "new.txt"), "changed")
+		await tracker.configure().hooks?.onEvent?.(runtimeEvent("run-finished"))
 		await second("request-2")
 		await vi.waitFor(() => expect(events.some((event) => event.properties?.boundary === "agent_yield")).toBe(true))
 		expect(events.find((event) => event.properties?.boundary === "agent_yield")?.properties?.preceding_request_id).toBe(

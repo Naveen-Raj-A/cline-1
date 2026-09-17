@@ -78,7 +78,11 @@ Design rule:
   VS Code Git observations belong to the open conversation, not the SDK runtime:
   an `ended` event may leave the chat open after a failure. Startup cleanup handles
   unopened observers; explicit host stop/disposal closes both normal and restored
-  observation windows.
+  observation windows. Each window emits its first Git snapshot, then only changes
+  to Git fields or workspace-root count; request IDs, timestamps, and boundaries
+  alone do not trigger emission. Consumers must carry the last observation forward
+  within that window rather than expect one event per request. Checks still run;
+  repeated file edits while already dirty need not change the recorded flags.
 
 ### `@cline/agents`
 

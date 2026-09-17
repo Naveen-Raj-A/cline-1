@@ -2,7 +2,7 @@ import { execFile } from "node:child_process"
 import { createHmac, randomBytes, randomUUID } from "node:crypto"
 import { resolve } from "node:path"
 import { setImmediate } from "node:timers/promises"
-import { promisify } from "node:util"
+import { isDeepStrictEqual, promisify } from "node:util"
 import { type ClineCoreStartInput, captureGitSnapshot, type GitSnapshotProperties, type ITelemetryService } from "@cline/core"
 import type { AgentAfterModelContext, AgentRuntimeEvent, AgentRuntimeStateSnapshot } from "@cline/shared"
 import { type Disposable, type Event, type Uri, workspace } from "vscode"
@@ -100,6 +100,7 @@ export class VscodeGitTelemetry {
 	private lastHead?: string
 	private lastHeadSequence = 0
 	private lastRequestId?: string
+	private lastEmittedState?: { git: GitSnapshot; workspaceRootCount: number }
 	private readonly pendingModels = new Map<string, ReturnType<VscodeGitTelemetry["snapshot"]>>()
 	private context: GitRuntimeContext = {}
 	private readonly subscriptions: Disposable[] = []
@@ -177,6 +178,10 @@ export class VscodeGitTelemetry {
 		extra: Pick<GitSnapshotProperties, "request_id" | "request_id_status" | "preceding_request_id"> = {},
 	) {
 		if (!this.enabled()) return
+		// Emit the first state, then changes only. Request IDs/boundaries are not state;
+		// consumers must carry observations forward within this observation window.
+		const state = { git: snapshot.git, workspaceRootCount: snapshot.workspaceRootCount }
+		if (isDeepStrictEqual(state, this.lastEmittedState)) return
 		try {
 			captureGitSnapshot(this.telemetry, {
 				schema_version: 1,
@@ -193,6 +198,7 @@ export class VscodeGitTelemetry {
 				git: snapshot.git,
 				...extra,
 			})
+			this.lastEmittedState = state
 		} catch {
 			// Telemetry must not interrupt inference or Git operations.
 		}
