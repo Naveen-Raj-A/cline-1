@@ -5,7 +5,7 @@ import { setImmediate } from "node:timers/promises"
 import { isDeepStrictEqual, promisify } from "node:util"
 import { type ClineCoreStartInput, captureGitSnapshot, type GitSnapshotProperties, type ITelemetryService } from "@cline/core"
 import type { AgentAfterModelContext, AgentRuntimeEvent, AgentRuntimeStateSnapshot } from "@cline/shared"
-import { type Disposable, type Event, type Uri, workspace } from "vscode"
+import { workspace } from "vscode"
 
 const execFileAsync = promisify(execFile)
 
@@ -38,34 +38,45 @@ export async function readGitSnapshot(cwd: string): Promise<GitSnapshot> {
 		(
 			await execFileAsync("git", ["-c", "core.fsmonitor=false", ...args], {
 				cwd,
-				// ponytail: cap each read at 1s/1MiB; split HEAD from status if large repos need better coverage.
+				// Bound background work; read identity separately if status exceeds these limits.
 				timeout: 1000,
 				maxBuffer: 1024 * 1024,
 				windowsHide: true,
 				env: { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
 			})
 		).stdout
-	let status: string
+	let status: string | undefined
+	let snapshot: GitSnapshot
 	try {
 		status = await git(["status", "--porcelain=v2", "--branch", "--untracked-files=normal"])
 	} catch (error) {
 		// Never export stderr: it can contain local paths, remotes, or credentials.
-		const stderr = (error as { stderr?: string }).stderr ?? ""
-		return { state: stderr.startsWith("fatal: not a git repository") ? "non_git" : "unavailable" }
+		const failure = error as { stderr?: string; code?: string; killed?: boolean }
+		if (failure.code !== "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" && !failure.killed) {
+			return { state: failure.stderr?.startsWith("fatal: not a git repository") ? "non_git" : "unavailable" }
+		}
 	}
-	const lines = status.split("\n")
-	const head = lines.find((line) => line.startsWith("# branch.oid "))?.slice(13)
-	const branch = lines.find((line) => line.startsWith("# branch.head "))?.slice(14)
-	if (!head) return { state: "unavailable" }
-	const snapshot: GitSnapshot = {
-		state: head === "(initial)" ? "unborn" : "ok",
-		...(head !== "(initial)" ? { head_sha: head } : {}),
-		...(branch && branch !== "(detached)" ? { branch } : {}),
-		dirty: lines.some((line) => /^[12u?] /.test(line)),
-		// Porcelain v2's XY columns: index, then worktree; unmerged entries set both.
-		staged: lines.some((line) => /^[12u] [^.]/.test(line)),
-		unstaged: lines.some((line) => /^[12u] .[^.]/.test(line)),
-		untracked: lines.some((line) => line.startsWith("? ")),
+	if (status === undefined) {
+		// Never infer clean/dirty from truncated status. Preserve cheap identity reads.
+		const head = await git(["rev-parse", "--verify", "HEAD"]).catch(() => undefined)
+		const branch = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]).catch(() => undefined)
+		if (!head && !branch) return { state: "unavailable" }
+		snapshot = { state: "partial", ...(head ? { head_sha: head.trim() } : {}), ...(branch ? { branch: branch.trim() } : {}) }
+	} else {
+		const lines = status.split("\n")
+		const head = lines.find((line) => line.startsWith("# branch.oid "))?.slice(13)
+		const branch = lines.find((line) => line.startsWith("# branch.head "))?.slice(14)
+		if (!head) return { state: "unavailable" }
+		snapshot = {
+			state: head === "(initial)" ? "unborn" : "ok",
+			...(head !== "(initial)" ? { head_sha: head } : {}),
+			...(branch && branch !== "(detached)" ? { branch } : {}),
+			dirty: lines.some((line) => /^[12u?] /.test(line)),
+			// Porcelain v2's XY columns: index, then worktree; unmerged entries set both.
+			staged: lines.some((line) => /^[12u] [^.]/.test(line)),
+			unstaged: lines.some((line) => /^[12u] .[^.]/.test(line)),
+			untracked: lines.some((line) => line.startsWith("? ")),
+		}
 	}
 	try {
 		const remotes = (await git(["remote", "-v"]))
@@ -82,29 +93,14 @@ export async function readGitSnapshot(cwd: string): Promise<GitSnapshot> {
 	return snapshot
 }
 
-interface GitRepository {
-	state: { HEAD?: { commit?: string }; onDidChange: Event<void> }
-}
-interface GitApi {
-	getRepository(uri: Uri): GitRepository | null
-	onDidOpenRepository: Event<GitRepository>
-}
-
 /** One observation window for one task's fixed starting directory, never the shell's cwd. */
 export class VscodeGitTelemetry {
 	private disposed = false
 	private opened = false
-	private running = false
 	private agentId?: string
 	private sequence = 0
-	private lastHead?: string
-	private lastHeadSequence = 0
-	private lastRequestId?: string
 	private lastEmittedState?: { git: GitSnapshot; workspaceRootCount: number }
 	private readonly pendingModels = new Map<string, ReturnType<VscodeGitTelemetry["snapshot"]>>()
-	private context: GitRuntimeContext = {}
-	private readonly subscriptions: Disposable[] = []
-	private repositorySubscription?: Disposable
 	private readonly windowId = randomUUID()
 	private readonly workspaceId: string
 
@@ -146,17 +142,20 @@ export class VscodeGitTelemetry {
 		return this.opened
 	}
 
-	async open(): Promise<void> {
+	open(): void {
+		// Mark successful startup for host cleanup; do not collect or emit yet.
 		this.opened = true
-		await this.capture("chat_open")
-		if (!this.disposed) void this.watchGit()
 	}
 
 	private enabled(): boolean {
-		return !this.disposed && this.telemetry.isEnabled()
+		try {
+			return !this.disposed && this.telemetry.isEnabled()
+		} catch {
+			return false // A broken telemetry adapter must not interrupt inference.
+		}
 	}
 
-	private async snapshot(runtimeContext: GitRuntimeContext = this.context) {
+	private async snapshot(runtimeContext: GitRuntimeContext) {
 		if (!this.enabled()) return undefined
 		const sequence = ++this.sequence
 		const observedAt = new Date().toISOString()
@@ -164,21 +163,12 @@ export class VscodeGitTelemetry {
 		const context = { ...runtimeContext }
 		const git = await readGitSnapshot(this.config.cwd)
 		if (!this.enabled()) return undefined
-		const headChanged = sequence > this.lastHeadSequence && git.state !== "unavailable" && git.head_sha !== this.lastHead
-		if (sequence > this.lastHeadSequence && git.state !== "unavailable") {
-			this.lastHeadSequence = sequence
-			this.lastHead = git.head_sha
-		}
-		return { git, sequence, observedAt, workspaceRootCount, context, headChanged }
+		return { git, sequence, observedAt, workspaceRootCount, context }
 	}
 
-	private emit(
-		snapshot: NonNullable<Awaited<ReturnType<VscodeGitTelemetry["snapshot"]>>>,
-		boundary: GitSnapshotProperties["boundary"],
-		extra: Pick<GitSnapshotProperties, "request_id" | "request_id_status" | "preceding_request_id"> = {},
-	) {
+	private emit(snapshot: NonNullable<Awaited<ReturnType<VscodeGitTelemetry["snapshot"]>>>, requestId?: string) {
 		if (!this.enabled()) return
-		// Emit the first state, then changes only. Request IDs/boundaries are not state;
+		// Emit the first state, then changes only. Request IDs are not state;
 		// consumers must carry observations forward within this observation window.
 		const state = { git: snapshot.git, workspaceRootCount: snapshot.workspaceRootCount }
 		if (isDeepStrictEqual(state, this.lastEmittedState)) return
@@ -193,10 +183,11 @@ export class VscodeGitTelemetry {
 				observation_window_id: this.windowId,
 				observation_sequence: snapshot.sequence,
 				observed_at: snapshot.observedAt,
-				boundary,
+				boundary: "model_call",
 				...snapshot.context,
 				git: snapshot.git,
-				...extra,
+				...(requestId ? { request_id: requestId } : {}),
+				request_id_status: requestId ? "present" : "missing",
 			})
 			this.lastEmittedState = state
 		} catch {
@@ -204,27 +195,15 @@ export class VscodeGitTelemetry {
 		}
 	}
 
-	private async capture(boundary: "chat_open" | "agent_yield" | "idle_head_changed"): Promise<void> {
-		const precedingRequestId = this.lastRequestId
-		const snapshot = await this.snapshot()
-		if (!snapshot) return
-		if (boundary === "idle_head_changed" && !snapshot.headChanged) return
-		this.emit(snapshot, boundary, precedingRequestId ? { preceding_request_id: precedingRequestId } : {})
-	}
-
 	private onEvent(event: AgentRuntimeEvent): void {
 		if (this.agentId && event.snapshot.agentId !== this.agentId) return
 		if (event.type === "run-started" || event.type === "turn-started") {
 			this.agentId ??= event.snapshot.agentId
-			this.running = true
-			this.context = { runId: event.snapshot.runId, iteration: event.snapshot.iteration }
 		} else if (event.type === "run-finished" || event.type === "run-failed") {
-			this.running = false
 			// Early failures/cancellation may never call afterModel.
 			for (const key of this.pendingModels.keys()) {
 				if (key.startsWith(`${event.snapshot.runId}:`)) this.pendingModels.delete(key)
 			}
-			void this.capture("agent_yield").catch(() => {})
 		}
 	}
 
@@ -244,50 +223,15 @@ export class VscodeGitTelemetry {
 		if (!observation || !this.enabled()) return
 		const id = rawId?.trim()
 		const requestId = id && /^[\w-]{1,128}$/.test(id) ? id : undefined
-		this.lastRequestId = requestId
 		void observation
 			.then((snapshot) => {
-				if (snapshot)
-					this.emit(snapshot, "model_call", {
-						...(requestId ? { request_id: requestId } : {}),
-						request_id_status: requestId ? "present" : "missing",
-					})
+				if (snapshot) this.emit(snapshot, requestId)
 			})
 			.catch(() => {})
-	}
-
-	private async watchGit(): Promise<void> {
-		try {
-			const vscode = await import("vscode")
-			const extension = vscode.extensions.getExtension<{ getAPI(version: 1): GitApi }>("vscode.git")
-			if (!extension) return
-			const api = (extension.isActive ? extension.exports : await extension.activate()).getAPI(1)
-			if (this.disposed) return
-			const attach = () => {
-				this.repositorySubscription?.dispose()
-				const repository = api.getRepository(vscode.Uri.file(this.config.cwd))
-				if (!repository) return
-				let notifiedHead = repository.state.HEAD?.commit
-				this.repositorySubscription = repository.state.onDidChange(() => {
-					const head = repository.state.HEAD?.commit
-					if (head === notifiedHead) return
-					notifiedHead = head
-					if (!this.running) void this.capture("idle_head_changed")
-				})
-				// Cover changes between the opening snapshot and listener attachment.
-				if (!this.running && notifiedHead !== this.lastHead) void this.capture("idle_head_changed")
-			}
-			attach()
-			this.subscriptions.push(api.onDidOpenRepository(attach))
-		} catch {
-			// Git extension unavailable/disabled: request and yield snapshots still work.
-		}
 	}
 
 	dispose(): void {
 		this.disposed = true
 		this.pendingModels.clear()
-		this.repositorySubscription?.dispose()
-		for (const subscription of this.subscriptions) subscription.dispose()
 	}
 }

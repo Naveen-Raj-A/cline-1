@@ -9,12 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { readGitSnapshot, sanitizeGitRemote, VscodeGitTelemetry } from "./git-telemetry"
 
 const vscodeGit = vi.hoisted(() => ({
-	available: true,
 	workspaceFolders: undefined as { uri: { fsPath: string } }[] | undefined,
-	head: undefined as string | undefined,
-	changed: new Set<() => void>(),
-	opened: new Set<() => void>(),
-	getRepository: vi.fn(),
+	statusFailure: undefined as { code?: string; killed?: boolean } | undefined,
 }))
 vi.mock("vscode", () => ({
 	workspace: {
@@ -22,25 +18,22 @@ vi.mock("vscode", () => ({
 			return vscodeGit.workspaceFolders
 		},
 	},
-	Uri: { file: (fsPath: string) => ({ fsPath }) },
-	extensions: {
-		getExtension: () =>
-			vscodeGit.available
-				? {
-						isActive: true,
-						exports: {
-							getAPI: () => ({
-								getRepository: vscodeGit.getRepository,
-								onDidOpenRepository: (listener: () => void) => {
-									vscodeGit.opened.add(listener)
-									return { dispose: () => vscodeGit.opened.delete(listener) }
-								},
-							}),
-						},
-					}
-				: undefined,
-	},
 }))
+
+vi.mock("node:child_process", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:child_process")>()
+	const { promisify } = await import("node:util")
+	const execute = promisify(actual.execFile)
+	return {
+		...actual,
+		execFile: Object.assign(actual.execFile.bind(null), {
+			[promisify.custom]: async (file: string, args: string[], options: import("node:child_process").ExecFileOptions) => {
+				if (args.includes("--porcelain=v2") && vscodeGit.statusFailure) throw vscodeGit.statusFailure
+				return execute(file, args, options)
+			},
+		}),
+	}
+})
 
 const execFileAsync = promisify(execFile)
 const tmp = resolve(import.meta.dirname, "../../../../tmp")
@@ -121,22 +114,8 @@ beforeEach(async () => {
 		flush: async () => {},
 		dispose: async () => {},
 	}
-	vscodeGit.available = true
+	vscodeGit.statusFailure = undefined
 	vscodeGit.workspaceFolders = [{ uri: { fsPath: cwd } }]
-	vscodeGit.head = undefined
-	vscodeGit.changed.clear()
-	vscodeGit.opened.clear()
-	vscodeGit.getRepository.mockReset().mockReturnValue({
-		state: {
-			get HEAD() {
-				return vscodeGit.head ? { commit: vscodeGit.head } : undefined
-			},
-			onDidChange: (listener: () => void) => {
-				vscodeGit.changed.add(listener)
-				return { dispose: () => vscodeGit.changed.delete(listener) }
-			},
-		},
-	})
 })
 afterEach(async () => {
 	for (const item of observers) item.dispose()
@@ -211,6 +190,36 @@ describe("Git snapshots", () => {
 		expect(await readGitSnapshot(join(cwd, "missing"))).toEqual({ state: "unavailable" })
 	})
 
+	it.each([
+		{ code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" },
+		{ killed: true },
+	])("preserves identity when status exceeds its limits (%j)", async (failure) => {
+		const head = await commit()
+		await git("remote", "add", "origin", "https://user:secret@example.test/repo?token=secret")
+		vscodeGit.statusFailure = failure
+		expect(await readGitSnapshot(cwd)).toEqual({
+			state: "partial",
+			head_sha: head,
+			branch: "main",
+			remote_state: "ok",
+			remote_url: "https://example.test/repo",
+		})
+		await git("checkout", "--detach", head)
+		expect(await readGitSnapshot(cwd)).toEqual({
+			state: "partial",
+			head_sha: head,
+			remote_state: "ok",
+			remote_url: "https://example.test/repo",
+		})
+	})
+
+	it("preserves an unborn branch when status times out, but does not invent identity if Git disappears", async () => {
+		vscodeGit.statusFailure = { killed: true }
+		expect(await readGitSnapshot(cwd)).toEqual({ state: "partial", branch: "main", remote_state: "none" })
+		await rm(join(cwd, ".git"), { recursive: true })
+		expect(await readGitSnapshot(cwd)).toEqual({ state: "unavailable" })
+	})
+
 	it("reports unavailable when Git is missing", async () => {
 		vi.stubEnv("PATH", join(cwd, "missing-bin"))
 		expect(await readGitSnapshot(cwd)).toEqual({ state: "unavailable" })
@@ -240,7 +249,7 @@ describe("Git snapshots", () => {
 })
 
 describe("conversation Git telemetry", () => {
-	it("emits only state changes across boundaries, including changes back to earlier states", async () => {
+	it("emits only state changes across requests, including changes back to earlier states", async () => {
 		const tracker = observer()
 		const snapshot = {
 			git: await readGitSnapshot(cwd),
@@ -248,14 +257,9 @@ describe("conversation Git telemetry", () => {
 			sequence: 1,
 			observedAt: new Date().toISOString(),
 			context: {},
-			headChanged: false,
 		}
-		tracker["emit"](snapshot, "chat_open")
-		for (const boundary of ["model_call", "agent_yield", "idle_head_changed"] as const) {
-			tracker["emit"]({ ...snapshot, sequence: 2, observedAt: "later", context: { iteration: 2 } }, boundary, {
-				request_id: "different-request",
-			})
-		}
+		tracker["emit"](snapshot, "request-1")
+		tracker["emit"]({ ...snapshot, sequence: 2, observedAt: "later", context: { iteration: 2 } }, "request-2")
 		expect(events).toHaveLength(1)
 		const changes = [
 			{ ...snapshot, workspaceRootCount: 2 },
@@ -263,6 +267,7 @@ describe("conversation Git telemetry", () => {
 				{ state: "unavailable" as const },
 				{ state: "non_git" as const },
 				{ state: "ok" as const },
+				{ state: "partial" as const },
 				{ head_sha: "new-head" },
 				{ branch: "other" },
 				{ dirty: true },
@@ -275,27 +280,28 @@ describe("conversation Git telemetry", () => {
 		]
 		for (const change of changes) {
 			const count = events.length
-			tracker["emit"](change, "model_call")
-			tracker["emit"](change, "agent_yield")
+			tracker["emit"](change, "request-3")
+			tracker["emit"](change, "request-4")
 			expect(events).toHaveLength(count + 1)
-			tracker["emit"](snapshot, "model_call")
+			tracker["emit"](snapshot, "request-5")
 			expect(events).toHaveLength(count + 2)
 		}
 	})
 
 	it("does not remember an opted-out or failed emission as the last emitted state", async () => {
-		vscodeGit.available = false
 		const tracker = observer()
+		const snapshot = await tracker["snapshot"]({})
+		if (!snapshot) throw new Error("snapshot missing")
 		enabled = false
-		await tracker.open()
+		tracker["emit"](snapshot)
 		enabled = true
 		const capture = vi.spyOn(telemetry, "capture").mockImplementationOnce(() => {
 			throw new Error("adapter failed")
 		})
-		await tracker.open()
+		tracker["emit"](snapshot)
 		expect(events).toHaveLength(0)
-		await tracker.open()
-		await tracker.open()
+		tracker["emit"](snapshot)
+		tracker["emit"](snapshot)
 		expect(events).toHaveLength(1)
 		expect(capture).toHaveBeenCalledTimes(2)
 		capture.mockRestore()
@@ -307,7 +313,8 @@ describe("conversation Git telemetry", () => {
 				? undefined
 				: Array.from({ length: count }, (_, i) => ({ uri: { fsPath: join(cwd, `root-${i}`) } }))
 		await rm(join(cwd, ".git"), { recursive: true })
-		await observer().open()
+		await (await beginModel(observer()))("request-1")
+		await vi.waitFor(() => expect(events).toHaveLength(1))
 		expect(events[0].properties).toMatchObject({ workspace_root_count: count ?? 0, git: { state: "non_git" } })
 		expect(JSON.stringify(events)).not.toContain(cwd)
 	})
@@ -321,7 +328,7 @@ describe("conversation Git telemetry", () => {
 		await finish("request-1")
 		await vi.waitFor(() => expect(events).toHaveLength(1))
 		expect(events[0].properties?.workspace_root_count).toBe(1)
-		await tracker.configure().hooks?.onEvent?.(runtimeEvent("run-finished"))
+		await (await beginModel(tracker, 3))("request-2")
 		await vi.waitFor(() => expect(events).toHaveLength(2))
 		expect(events[1].properties?.workspace_root_count).toBe(2)
 	})
@@ -435,83 +442,80 @@ describe("conversation Git telemetry", () => {
 		expect(events).toEqual([])
 	})
 
-	it("captures yield and only HEAD changes while idle, then removes all listeners on close", async () => {
-		vscodeGit.head = await commit()
+	it("emits only afterModel, without opening/yield/idle events consuming request-linked changes", async () => {
 		const originalHook = vi.fn()
 		const tracker = observer({ hooks: { onEvent: originalHook } })
 		const config = tracker.configure()
-		await tracker.open()
-		await vi.waitFor(() => expect(vscodeGit.changed.size).toBe(1))
-		for (const listener of vscodeGit.changed) listener() // unchanged (e.g. file edit/staging)
-		expect(events).toHaveLength(1)
+		const enabledCheck = vi.spyOn(telemetry, "isEnabled")
+		tracker.open()
 		await config.hooks?.onEvent?.(runtimeEvent("run-started"))
-		vscodeGit.head = await commit()
-		for (const listener of vscodeGit.changed) listener()
-		expect(events).toHaveLength(1)
+		expect(enabledCheck).not.toHaveBeenCalled()
+		const finish = await beginModel(tracker)
+		await vi.waitFor(() => expect(enabledCheck.mock.calls.length).toBeGreaterThanOrEqual(3))
+		expect(events).toHaveLength(0)
+		await finish("request-1")
+		await vi.waitFor(() => expect(events).toHaveLength(1))
+		const head = await commit()
+		enabledCheck.mockClear()
 		await config.hooks?.onEvent?.(runtimeEvent("run-finished"))
-		await vi.waitFor(() => expect(events.at(-1)?.properties?.boundary).toBe("agent_yield"))
-		vscodeGit.head = await commit()
-		for (const listener of vscodeGit.changed) listener()
-		await vi.waitFor(() => expect(events.at(-1)?.properties?.boundary).toBe("idle_head_changed"))
-		expect(originalHook).toHaveBeenCalledTimes(2)
-		expect(vscodeGit.getRepository).toHaveBeenCalledWith({ fsPath: cwd })
-		tracker.dispose()
-		expect(vscodeGit.changed.size).toBe(0)
-		expect(vscodeGit.opened.size).toBe(0)
-		const count = events.length
 		await config.hooks?.onEvent?.(runtimeEvent("run-failed"))
-		expect(events).toHaveLength(count)
+		expect(enabledCheck).not.toHaveBeenCalled()
+		expect(events).toHaveLength(1)
+		await (await beginModel(tracker, 3))("request-2")
+		await vi.waitFor(() => expect(events).toHaveLength(2))
+		expect(events[1].properties).toMatchObject({ boundary: "model_call", request_id: "request-2", git: { head_sha: head } })
+		expect(originalHook).toHaveBeenCalledTimes(3)
 	})
 
-	it("keeps the yield's preceding request ID when another model call completes during its Git read", async () => {
-		const tracker = observer()
-		const first = await beginModel(tracker, 1)
-		await first("request-1")
-		await vi.waitFor(() => expect(events).toHaveLength(1))
-		const enabledCheck = vi.spyOn(telemetry, "isEnabled")
-		const second = await beginModel(tracker, 2)
-		await vi.waitFor(() => expect(enabledCheck.mock.calls.length).toBeGreaterThanOrEqual(3))
-		await writeFile(join(cwd, "new.txt"), "changed")
-		await tracker.configure().hooks?.onEvent?.(runtimeEvent("run-finished"))
-		await second("request-2")
-		await vi.waitFor(() => expect(events.some((event) => event.properties?.boundary === "agent_yield")).toBe(true))
-		expect(events.find((event) => event.properties?.boundary === "agent_yield")?.properties?.preceding_request_id).toBe(
-			"request-1",
-		)
+	it("fails closed if consent checks throw without breaking either model hook", async () => {
+		const beforeModel = vi.fn()
+		const afterModel = vi.fn()
+		const tracker = observer({ hooks: { beforeModel, afterModel } })
+		const check = vi.spyOn(telemetry, "isEnabled").mockImplementation(() => {
+			throw new Error("adapter failed")
+		})
+		await (await beginModel(tracker, 1))("skipped")
+		check.mockRestore()
+		const ready = vi.spyOn(telemetry, "isEnabled")
+		const finish = await beginModel(tracker, 2)
+		await vi.waitFor(() => expect(ready.mock.calls.length).toBeGreaterThanOrEqual(3))
+		ready.mockImplementation(() => {
+			throw new Error("adapter failed")
+		})
+		await finish("also-skipped")
+		expect(beforeModel).toHaveBeenCalledTimes(2)
+		expect(afterModel).toHaveBeenCalledTimes(2)
+		expect(events).toEqual([])
+		ready.mockRestore()
 	})
 
 	it("discards model observations after close and cleans up missing afterModel callbacks", async () => {
 		const tracker = observer()
 		const late = await beginModel(tracker)
 		await tracker.configure().hooks?.onEvent?.(runtimeEvent("run-failed"))
-		await vi.waitFor(() => expect(events).toHaveLength(1))
-		expect(events[0].properties?.boundary).toBe("agent_yield")
 		await late("no-longer-pending")
 		const closed = await beginModel(tracker)
 		tracker.dispose()
 		await closed("closed")
-		expect(events).toHaveLength(1)
+		expect(events).toHaveLength(0)
 	})
 
-	it("attaches when a previously non-Git directory becomes a repository", async () => {
-		const repository = vscodeGit.getRepository()
-		vscodeGit.getRepository.mockReturnValue(null)
+	it("detects a previously non-Git directory becoming a repository on the next model call", async () => {
+		const tracker = observer()
 		await rm(join(cwd, ".git"), { recursive: true })
-		await observer().open()
-		await vi.waitFor(() => expect(vscodeGit.opened.size).toBe(1))
+		await (await beginModel(tracker))("request-1")
+		await vi.waitFor(() => expect(events).toHaveLength(1))
 		expect(events[0].properties?.git).toEqual({ state: "non_git" })
 		await git("init", "-b", "main")
 		await git("config", "user.name", "Test")
 		await git("config", "user.email", "test@example.test")
-		vscodeGit.head = await commit()
-		vscodeGit.getRepository.mockReturnValue(repository)
-		for (const listener of vscodeGit.opened) listener()
-		await vi.waitFor(() => expect(events.at(-1)?.properties?.boundary).toBe("idle_head_changed"))
-		expect((events.at(-1)?.properties?.git as TelemetryProperties).head_sha).toBe(vscodeGit.head)
+		const head = await commit()
+		await (await beginModel(tracker, 3))("request-2")
+		await vi.waitFor(() => expect(events).toHaveLength(2))
+		expect(events[1].properties).toMatchObject({ boundary: "model_call", request_id: "request-2", git: { head_sha: head } })
 	})
 
 	it("uses private keyed workspace IDs, stable across reopenings but distinct across worktrees and tasks", async () => {
-		vscodeGit.available = false
 		await commit()
 		const worktree = join(cwd, "other-worktree")
 		await git("worktree", "add", "--detach", worktree, "HEAD")
@@ -519,10 +523,12 @@ describe("conversation Git telemetry", () => {
 		expect(first.hasOpened).toBe(false)
 		await first.open()
 		expect(first.hasOpened).toBe(true)
-		first.dispose()
-		await observer({ cwd: worktree }).open()
-		await observer().open()
-		await observer({ sessionId: "other-task" }).open()
+		for (const tracker of [first, observer({ cwd: worktree }), observer(), observer({ sessionId: "other-task" })]) {
+			const count = events.length
+			await (await beginModel(tracker))("request-1")
+			await vi.waitFor(() => expect(events).toHaveLength(count + 1))
+			tracker.dispose()
+		}
 		expect(events[0].properties?.workspace_id).not.toBe(events[1].properties?.workspace_id)
 		expect(events[0].properties?.workspace_id).toBe(events[2].properties?.workspace_id)
 		expect(events[0].properties?.observation_window_id).not.toBe(events[2].properties?.observation_window_id)

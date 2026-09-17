@@ -239,7 +239,7 @@ export class VscodeSessionHost implements SdkSessionHost {
 	async start(input: ClineCoreStartInput): Promise<StartSessionResult>
 	async start(input: StartSessionInput | ClineCoreStartInput): Promise<StartSessionResult> {
 		const result = await this.inner.start(input as ClineCoreStartInput)
-		void this.gitTelemetry.get(result.sessionId)?.open()
+		this.gitTelemetry.get(result.sessionId)?.open()
 		return result
 	}
 
@@ -326,7 +326,7 @@ export class VscodeSessionHost implements SdkSessionHost {
 		}
 		try {
 			const result = await this.inner.restore(input)
-			if (result.startResult && result.sessionId) void this.gitTelemetry.get(result.sessionId)?.open()
+			if (result.startResult && result.sessionId) this.gitTelemetry.get(result.sessionId)?.open()
 			return result
 		} catch (error) {
 			const sessionId = input.start?.config.sessionId

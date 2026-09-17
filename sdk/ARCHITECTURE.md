@@ -78,11 +78,14 @@ Design rule:
   VS Code Git observations belong to the open conversation, not the SDK runtime:
   an `ended` event may leave the chat open after a failure. Startup cleanup handles
   unopened observers; explicit host stop/disposal closes both normal and restored
-  observation windows. Each window emits its first Git snapshot, then only changes
-  to Git fields or workspace-root count; request IDs, timestamps, and boundaries
-  alone do not trigger emission. Consumers must carry the last observation forward
-  within that window rather than expect one event per request. Checks still run;
-  repeated file edits while already dirty need not change the recorded flags.
+  observation windows. Git reads run in the background from `beforeModel`; only
+  `afterModel` emits, with the surfaced request ID when available. Each window
+  emits its first snapshot, then only changes to Git fields or workspace-root count.
+  There are no opening, yield, or idle emissions or Git-extension watchers. Changes
+  after the final model call require a later call to be observed. Consumers must
+  carry observations forward within that window rather than expect an event per
+  request. Repeated edits while already dirty need not change the recorded flags.
+  Status limits preserve cheap identity reads as `partial`, without dirty flags.
 
 ### `@cline/agents`
 

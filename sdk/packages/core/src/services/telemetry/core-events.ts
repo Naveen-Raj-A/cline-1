@@ -145,15 +145,14 @@ export interface GitSnapshotProperties {
 	observation_window_id: string;
 	observation_sequence: number;
 	observed_at: string;
-	boundary: "chat_open" | "model_call" | "agent_yield" | "idle_head_changed";
+	boundary: "model_call";
 	runId?: string;
 	iteration?: number;
 	agentId?: string;
 	request_id?: string;
-	request_id_status?: "present" | "missing";
-	preceding_request_id?: string;
+	request_id_status: "present" | "missing";
 	git: {
-		state: "ok" | "unborn" | "non_git" | "unavailable";
+		state: "ok" | "unborn" | "non_git" | "unavailable" | "partial";
 		head_sha?: string;
 		branch?: string;
 		dirty?: boolean;
