@@ -141,6 +141,7 @@ export interface GitSnapshotProperties {
 	ulid: string;
 	providerId: string;
 	workspace_id: string;
+	workspace_root_count: number;
 	observation_window_id: string;
 	observation_sequence: number;
 	observed_at: string;
@@ -156,6 +157,9 @@ export interface GitSnapshotProperties {
 		head_sha?: string;
 		branch?: string;
 		dirty?: boolean;
+		staged?: boolean;
+		unstaged?: boolean;
+		untracked?: boolean;
 		remote_url?: string;
 		remote_state?: "ok" | "none" | "unsupported" | "unavailable";
 	};

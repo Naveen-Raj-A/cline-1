@@ -41,13 +41,21 @@ const gitSnapshot: GitSnapshotProperties = {
 	ulid: "session-1",
 	providerId: "cline",
 	workspace_id: "opaque-workspace",
+	workspace_root_count: 2,
 	observation_window_id: "window-1",
 	observation_sequence: 1,
 	observed_at: "2026-01-01T00:00:00.000Z",
 	boundary: "model_call",
 	request_id: "backend-request",
 	request_id_status: "present",
-	git: { state: "ok", head_sha: "a".repeat(40), dirty: false },
+	git: {
+		state: "ok",
+		head_sha: "a".repeat(40),
+		dirty: false,
+		staged: false,
+		unstaged: false,
+		untracked: false,
+	},
 };
 
 interface TelemetryStub {

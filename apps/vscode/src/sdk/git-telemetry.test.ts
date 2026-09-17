@@ -10,12 +10,18 @@ import { readGitSnapshot, sanitizeGitRemote, VscodeGitTelemetry } from "./git-te
 
 const vscodeGit = vi.hoisted(() => ({
 	available: true,
+	workspaceFolders: undefined as { uri: { fsPath: string } }[] | undefined,
 	head: undefined as string | undefined,
 	changed: new Set<() => void>(),
 	opened: new Set<() => void>(),
 	getRepository: vi.fn(),
 }))
 vi.mock("vscode", () => ({
+	workspace: {
+		get workspaceFolders() {
+			return vscodeGit.workspaceFolders
+		},
+	},
 	Uri: { file: (fsPath: string) => ({ fsPath }) },
 	extensions: {
 		getExtension: () =>
@@ -116,6 +122,7 @@ beforeEach(async () => {
 		dispose: async () => {},
 	}
 	vscodeGit.available = true
+	vscodeGit.workspaceFolders = [{ uri: { fsPath: cwd } }]
 	vscodeGit.head = undefined
 	vscodeGit.changed.clear()
 	vscodeGit.opened.clear()
@@ -139,19 +146,51 @@ afterEach(async () => {
 
 describe("Git snapshots", () => {
 	it("distinguishes unborn, clean, untracked, ignored, staged, and unstaged states", async () => {
-		expect(await readGitSnapshot(cwd)).toMatchObject({ state: "unborn", branch: "main", dirty: false, remote_state: "none" })
+		const clean = { dirty: false, staged: false, unstaged: false, untracked: false }
+		expect(await readGitSnapshot(cwd)).toMatchObject({ state: "unborn", branch: "main", ...clean, remote_state: "none" })
 		const head = await commit()
-		expect(await readGitSnapshot(cwd)).toMatchObject({ state: "ok", head_sha: head, dirty: false })
+		expect(await readGitSnapshot(cwd)).toMatchObject({ state: "ok", head_sha: head, ...clean })
 		await writeFile(join(cwd, "untracked.txt"), "new file")
-		expect((await readGitSnapshot(cwd)).dirty).toBe(true)
+		expect(await readGitSnapshot(cwd)).toMatchObject({ dirty: true, staged: false, unstaged: false, untracked: true })
 		await writeFile(join(cwd, ".git", "info", "exclude"), "untracked.txt\n")
-		expect((await readGitSnapshot(cwd)).dirty).toBe(false)
+		expect(await readGitSnapshot(cwd)).toMatchObject(clean)
 		await writeFile(join(cwd, "tracked.txt"), "initial")
 		await git("add", "tracked.txt")
-		expect((await readGitSnapshot(cwd)).dirty).toBe(true)
+		expect(await readGitSnapshot(cwd)).toMatchObject({ dirty: true, staged: true, unstaged: false, untracked: false })
 		await commit()
 		await writeFile(join(cwd, "tracked.txt"), "modified")
-		expect((await readGitSnapshot(cwd)).dirty).toBe(true)
+		expect(await readGitSnapshot(cwd)).toMatchObject({ dirty: true, staged: false, unstaged: true, untracked: false })
+		await git("add", "tracked.txt")
+		await writeFile(join(cwd, "tracked.txt"), "modified again")
+		await writeFile(join(cwd, "another.txt"), "new file")
+		expect(await readGitSnapshot(cwd)).toMatchObject({ dirty: true, staged: true, unstaged: true, untracked: true })
+	})
+
+	it("includes staged renames and unstaged deletions", async () => {
+		await writeFile(join(cwd, "tracked.txt"), "initial")
+		await git("add", "tracked.txt")
+		await commit()
+		await git("config", "status.renames", "true")
+		await git("mv", "tracked.txt", "renamed.txt")
+		expect(await readGitSnapshot(cwd)).toMatchObject({ dirty: true, staged: true, unstaged: false, untracked: false })
+		await rm(join(cwd, "renamed.txt"))
+		expect(await readGitSnapshot(cwd)).toMatchObject({ dirty: true, staged: true, unstaged: true, untracked: false })
+	})
+
+	it("marks unmerged entries as changes on both index and worktree sides", async () => {
+		await writeFile(join(cwd, "conflict.txt"), "base\n")
+		await git("add", "conflict.txt")
+		await commit()
+		await git("checkout", "-b", "other")
+		await writeFile(join(cwd, "conflict.txt"), "other\n")
+		await git("add", "conflict.txt")
+		await commit()
+		await git("checkout", "main")
+		await writeFile(join(cwd, "conflict.txt"), "main\n")
+		await git("add", "conflict.txt")
+		await commit()
+		await expect(git("merge", "other")).rejects.toThrow()
+		expect(await readGitSnapshot(cwd)).toMatchObject({ dirty: true, staged: true, unstaged: true, untracked: false })
 	})
 
 	it("reads the actual HEAD for detached checkouts and separate worktrees", async () => {
@@ -201,6 +240,31 @@ describe("Git snapshots", () => {
 })
 
 describe("conversation Git telemetry", () => {
+	it.each([undefined, 0, 1, 2])("reports the VS Code workspace-folder count (%s), including outside Git", async (count) => {
+		vscodeGit.workspaceFolders =
+			count === undefined
+				? undefined
+				: Array.from({ length: count }, (_, i) => ({ uri: { fsPath: join(cwd, `root-${i}`) } }))
+		await rm(join(cwd, ".git"), { recursive: true })
+		await observer().open()
+		expect(events[0].properties).toMatchObject({ workspace_root_count: count ?? 0, git: { state: "non_git" } })
+		expect(JSON.stringify(events)).not.toContain(cwd)
+	})
+
+	it("records root count at observation time and picks up folder changes on later boundaries", async () => {
+		const enabledCheck = vi.spyOn(telemetry, "isEnabled")
+		const tracker = observer()
+		const finish = await beginModel(tracker)
+		await vi.waitFor(() => expect(enabledCheck.mock.calls.length).toBeGreaterThanOrEqual(3))
+		vscodeGit.workspaceFolders?.push({ uri: { fsPath: join(cwd, "second-root") } })
+		await finish("request-1")
+		await vi.waitFor(() => expect(events).toHaveLength(1))
+		expect(events[0].properties?.workspace_root_count).toBe(1)
+		await tracker.configure().hooks?.onEvent?.(runtimeEvent("run-finished"))
+		await vi.waitFor(() => expect(events).toHaveLength(2))
+		expect(events[1].properties?.workspace_root_count).toBe(2)
+	})
+
 	it("preserves config values and uses its identity for telemetry and request matching", async () => {
 		const delegate = vi.fn(async () => new Response("ok", { headers: { "X-Request-ID": "request-1" } }))
 		const providerConfig = {
@@ -229,6 +293,8 @@ describe("conversation Git telemetry", () => {
 			ulid: "custom-task",
 			providerId: "cline-pass",
 			request_id: "request-1",
+			workspace_root_count: 1,
+			git: { dirty: false, staged: false, unstaged: false, untracked: false },
 		})
 		expect(observer({ providerId: "cline-pass" }).configure().providerConfig).toBeUndefined()
 	})

@@ -5,7 +5,7 @@ import { setImmediate } from "node:timers/promises"
 import { promisify } from "node:util"
 import { type ClineCoreStartInput, captureGitSnapshot, type GitSnapshotProperties, type ITelemetryService } from "@cline/core"
 import type { AgentAfterModelContext, AgentRuntimeEvent, AgentRuntimeStateSnapshot } from "@cline/shared"
-import type { Disposable, Event, Uri } from "vscode"
+import { type Disposable, type Event, type Uri, workspace } from "vscode"
 
 const execFileAsync = promisify(execFile)
 
@@ -62,6 +62,10 @@ export async function readGitSnapshot(cwd: string): Promise<GitSnapshot> {
 		...(head !== "(initial)" ? { head_sha: head } : {}),
 		...(branch && branch !== "(detached)" ? { branch } : {}),
 		dirty: lines.some((line) => /^[12u?] /.test(line)),
+		// Porcelain v2's XY columns: index, then worktree; unmerged entries set both.
+		staged: lines.some((line) => /^[12u] [^.]/.test(line)),
+		unstaged: lines.some((line) => /^[12u] .[^.]/.test(line)),
+		untracked: lines.some((line) => line.startsWith("? ")),
 	}
 	try {
 		const remotes = (await git(["remote", "-v"]))
@@ -155,6 +159,7 @@ export class VscodeGitTelemetry {
 		if (!this.enabled()) return undefined
 		const sequence = ++this.sequence
 		const observedAt = new Date().toISOString()
+		const workspaceRootCount = workspace.workspaceFolders?.length ?? 0
 		const context = { ...runtimeContext }
 		const git = await readGitSnapshot(this.config.cwd)
 		if (!this.enabled()) return undefined
@@ -163,7 +168,7 @@ export class VscodeGitTelemetry {
 			this.lastHeadSequence = sequence
 			this.lastHead = git.head_sha
 		}
-		return { git, sequence, observedAt, context, headChanged }
+		return { git, sequence, observedAt, workspaceRootCount, context, headChanged }
 	}
 
 	private emit(
@@ -179,6 +184,7 @@ export class VscodeGitTelemetry {
 				ulid: this.config.sessionId,
 				providerId: this.config.providerId,
 				workspace_id: this.workspaceId,
+				workspace_root_count: snapshot.workspaceRootCount,
 				observation_window_id: this.windowId,
 				observation_sequence: snapshot.sequence,
 				observed_at: snapshot.observedAt,
